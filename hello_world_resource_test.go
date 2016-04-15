@@ -12,7 +12,7 @@ const mockEvent = `
 {
   "RequestType": "Create",
   "ServiceToken": "arn:aws:lambda:us-west-2:123412341234:function:mock",
-  "ResponseURL": "https://cloudformation-custom-resource-response-uswest2.s3-us-west-2.amazonaws.com/arn%3Aaws%3Acloudformation%3Aus-west-2%3A123412341234%3Astack/SpartaApplication/7b1329a0-cdbb-11e5-8739-50d5ca0184d2%7CConfigS3b53d1a94bfa7819abce144e99da6bb69becf0421%7Cf6f7ab4f-319d-4726-af8b-dbe56c1714a9?AWSAccessKeyId=AKIAI4KYMPPRGIACET5Q&Expires=1454871368&Signature=gt42bZajCWi1rLp5myu4X9MYbRg%3D",
+  "ResponseURL": "",
   "StackId": "arn:aws:cloudformation:us-west-2:123412341234:stack/CloudFormationResources",
   "RequestId": "f6f7ab4f-319d-4726-af8b-dbe56c1714a9",
   "LogicalResourceId": "SomeLogicalIdb53d1a94bfa7819abce144e99da6bb69becf0421",
@@ -26,16 +26,16 @@ const mockEvent = `
 
 func TestCreateHelloWorld(t *testing.T) {
 	resHello := gocf.NewResourceByType(HelloWorld)
-	customResource := resHello.(HelloWorldResource)
+	customResource := resHello.(*HelloWorldResource)
 	customResource.Message = "Hello world"
 }
 
 func TestCreateHelloWorldNewInstances(t *testing.T) {
 	resHello1 := gocf.NewResourceByType(HelloWorld)
-	customResource1 := resHello1.(HelloWorldResource)
+	customResource1 := resHello1.(*HelloWorldResource)
 
 	resHello2 := gocf.NewResourceByType(HelloWorld)
-	customResource2 := resHello2.(HelloWorldResource)
+	customResource2 := resHello2.(*HelloWorldResource)
 
 	if &customResource1 == &customResource2 {
 		t.Errorf("gocf.NewResourceByType failed to make new instances")
@@ -44,7 +44,7 @@ func TestCreateHelloWorldNewInstances(t *testing.T) {
 
 func TestExecuteCreateHelloWorld(t *testing.T) {
 	resHello1 := gocf.NewResourceByType(HelloWorld)
-	customResource1 := resHello1.(HelloWorldResource)
+	customResource1 := resHello1.(*HelloWorldResource)
 	customResource1.Message = "Create resource here"
 
 	logger := logrus.New()
