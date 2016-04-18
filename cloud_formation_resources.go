@@ -327,6 +327,12 @@ func Handle(request *CustomResourceRequest, logger *logrus.Logger) error {
 		goAWSResourceType = "Unknown"
 	}
 
+	logger.WithFields(logrus.Fields{
+		"CustomResource": goAWSResourceType,
+		"Operation":      request.RequestType,
+		"StackId":        request.StackID,
+	}).Info("CustomResource request")
+
 	if nil == operationError && executeOp {
 		commandInstance, commandError := customCommandForTypeName(goAWSResourceType, &marshaledProperties)
 		if nil != commandError {
