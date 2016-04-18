@@ -1,18 +1,31 @@
 package cloudformationresources
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"net/http"
 	"net/url"
-	"strconv"
+	"strings"
 
 	"github.com/Sirupsen/logrus"
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/cloudformation"
 	gocf "github.com/crewjam/go-cloudformation"
+)
+
+const (
+	// CreateOperation is a request to create a resource
+	// @enum CloudFormationOperation
+	CreateOperation = "Create"
+	// DeleteOperation is a request to delete a resource
+	// @enum CloudFormationOperation
+	DeleteOperation = "Delete"
+	// UpdateOperation is a request to update a resource
+	// @enum CloudFormationOperation
+	UpdateOperation = "Update"
 )
 
 // CloudFormationLambdaEvent represents the event data sent during a
@@ -38,6 +51,9 @@ type CustomResourceRequest struct {
 	StackID            string `json:"StackId"`
 	RequestID          string `json:"RequestId"`
 	LogicalResourceID  string `json:"LogicalResourceId"`
+	PhysicalResourceID string `json:"PhysicalResourceId"`
+	LogGroupName       string `json:"logGroupName"`
+	LogStreamName      string `json:"logStreamName"`
 	ResourceProperties map[string]interface{}
 }
 
@@ -61,22 +77,114 @@ type CustomResourceCommand interface {
 		logger *logrus.Logger) (map[string]interface{}, error)
 }
 
-const (
-	// CreateOperation is a request to create a resource
-	// @enum CloudFormationOperation
-	CreateOperation = "Create"
-	// DeleteOperation is a request to delete a resource
-	// @enum CloudFormationOperation
-	DeleteOperation = "Delete"
-	// UpdateOperation is a request to update a resource
-	// @enum CloudFormationOperation
-	UpdateOperation = "Update"
-)
-
 var (
 	// HelloWorld is the typename for HelloWorldResource
 	HelloWorld = cloudFormationResourceType("HelloWorldResource")
+	// S3LambdaEventSource is the typename for S3LambdaEventSourceResource
+	S3LambdaEventSource = cloudFormationResourceType("S3LambdaEventSourceResource")
 )
+
+func sendCloudFormationResponse(customResourceRequest *CustomResourceRequest,
+	results map[string]interface{},
+	responseErr error,
+	logger *logrus.Logger) error {
+
+	parsedURL, parsedURLErr := url.ParseRequestURI(customResourceRequest.ResponseURL)
+	if nil != parsedURLErr {
+		return parsedURLErr
+	}
+
+	status := "FAILED"
+	if nil == responseErr {
+		status = "SUCCESS"
+	}
+	reasonText := ""
+	if nil != responseErr {
+		reasonText = fmt.Sprintf("%s. Details in CloudWatch Logs: %s : %s",
+			responseErr.Error(),
+			customResourceRequest.LogGroupName,
+			customResourceRequest.LogStreamName)
+	} else {
+		reasonText = fmt.Sprintf("Details in CloudWatch Logs: %s : %s",
+			customResourceRequest.LogGroupName,
+			customResourceRequest.LogStreamName)
+	}
+
+	responseData := map[string]interface{}{
+		"Status":             status,
+		"Reason":             reasonText,
+		"PhysicalResourceId": customResourceRequest.PhysicalResourceID,
+		"StackId":            customResourceRequest.StackID,
+		"RequestId":          customResourceRequest.RequestID,
+		"LogicalResourceId":  customResourceRequest.LogicalResourceID,
+	}
+	if nil != responseErr {
+		responseData["Data"] = map[string]interface{}{
+			"Error": responseErr,
+		}
+	} else if len(results) != 0 {
+		responseData["Data"] = results
+	} else {
+		responseData["Data"] = map[string]interface{}{}
+	}
+
+	logger.WithFields(logrus.Fields{
+		"ResponsePayload": responseData,
+	}).Debug("Response Info")
+
+	jsonData, jsonError := json.Marshal(responseData)
+	if nil != jsonError {
+		return jsonError
+	}
+
+	responseBuffer := strings.NewReader(string(jsonData))
+	req, httpErr := http.NewRequest("PUT", customResourceRequest.ResponseURL, responseBuffer)
+
+	if nil != httpErr {
+		return httpErr
+	}
+	// Need to use the Opaque field b/c Go will parse inline encoded values
+	// which are supposed to be roundtripped to AWS.
+	// Ref: https://tools.ietf.org/html/rfc3986#section-2.2
+	// Ref: https://golang.org/pkg/net/url/#URL
+	req.URL = &url.URL{
+		Scheme:   parsedURL.Scheme,
+		Host:     parsedURL.Host,
+		Opaque:   parsedURL.RawPath,
+		RawQuery: parsedURL.RawQuery,
+	}
+	logger.WithFields(logrus.Fields{
+		"URL": req.URL,
+	}).Debug("Created URL response")
+
+	// Although it seems reasonable to set the Content-Type to "application/json" - don't.
+	// The Content-Type must be an empty string in order for the
+	// AWS Signature checker to pass.
+	// Ref: http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-lambda-function-code.html
+	req.Header.Set("Content-Type", "")
+
+	client := &http.Client{}
+	resp, httpErr := client.Do(req)
+	if httpErr != nil {
+		return httpErr
+	}
+	logger.WithFields(logrus.Fields{
+		"LogicalResourceId":  customResourceRequest.LogicalResourceID,
+		"Result":             responseData["Status"],
+		"ResponseStatusCode": resp.StatusCode,
+	}).Info("Sent CloudFormation response")
+
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		body, bodyErr := ioutil.ReadAll(resp.Body)
+		if bodyErr != nil {
+			logger.Warn("Unable to read body: " + bodyErr.Error())
+			body = []byte{}
+		}
+		return fmt.Errorf("Error sending response: %d. Data: %s", resp.StatusCode, string(body))
+	}
+	defer resp.Body.Close()
+	return nil
+}
 
 func customCommandForTypeName(resourceTypeName string, properties *[]byte) (interface{}, error) {
 	var unmarshalError error
@@ -94,7 +202,18 @@ func customCommandForTypeName(resourceTypeName string, properties *[]byte) (inte
 			unmarshalError = json.Unmarshal([]byte(string(*properties)), &command)
 		}
 		customCommand = &command
+	case S3LambdaEventSource:
+		command := S3LambdaEventSourceResource{
+			GoAWSCustomResource: GoAWSCustomResource{
+				GoAWSType: resourceTypeName,
+			},
+		}
+		if nil != properties {
+			unmarshalError = json.Unmarshal([]byte(string(*properties)), &command)
+		}
+		customCommand = &command
 	}
+
 	// END - RESOURCE TYPES
 	// ---------------------------------------------------------------------------
 
@@ -123,11 +242,28 @@ func init() {
 	gocf.RegisterCustomResourceProvider(customTypeProvider)
 }
 
+type logrusProxy struct {
+	logger *logrus.Logger
+}
+
+func (proxy *logrusProxy) Log(args ...interface{}) {
+	proxy.logger.Info(args...)
+}
+
 // Returns an AWS Session (https://github.com/aws/aws-sdk-go/wiki/Getting-Started-Configuration)
 // object that attaches a debug level handler to all AWS requests from services
 // sharing the session value.
 func awsSession(logger *logrus.Logger) *session.Session {
-	sess := session.New()
+	awsConfig := &aws.Config{
+		CredentialsChainVerboseErrors: aws.Bool(true),
+	}
+	// Log AWS calls if needed
+	switch logger.Level {
+	case logrus.DebugLevel:
+		awsConfig.LogLevel = aws.LogLevel(aws.LogDebugWithRequestErrors)
+	}
+	awsConfig.Logger = &logrusProxy{logger}
+	sess := session.New(awsConfig)
 	sess.Handlers.Send.PushFront(func(r *request.Request) {
 		logger.WithFields(logrus.Fields{
 			"Service":   r.ClientInfo.ServiceName,
@@ -146,74 +282,19 @@ func cloudFormationResourceType(resType string) string {
 	return fmt.Sprintf("Custom::goAWS::%s", resType)
 }
 
-func sendCloudFormationResponse(customResourceRequest *CustomResourceRequest,
-	results map[string]interface{},
-	responseErr error, logger *logrus.Logger) error {
-
-	parsedURL, parsedURLErr := url.ParseRequestURI(customResourceRequest.ResponseURL)
-	if nil != parsedURLErr {
-		return parsedURLErr
-	}
-
-	status := "FAILED"
-	if nil == responseErr {
-		status = "SUCCESS"
-	}
-	responseData := map[string]interface{}{
-		"Status":             status,
-		"Reason":             fmt.Sprintf("See the details in the CloudWatch Log Stream"),
-		"PhysicalResourceId": customResourceRequest.LogicalResourceID,
-		"StackId":            customResourceRequest.StackID,
-		"RequestId":          customResourceRequest.RequestID,
-		"LogicalResourceId":  customResourceRequest.LogicalResourceID,
-		"Data":               results,
-	}
-	jsonData, jsonError := json.Marshal(responseData)
-	if nil != jsonError {
-		return jsonError
-	}
-	responseBuffer := bytes.NewBuffer(jsonData)
-	req, httpErr := http.NewRequest("PUT", customResourceRequest.ResponseURL, responseBuffer)
-	if nil != httpErr {
-		return httpErr
-	}
-	// Need to use the Opaque field b/c Go will parse inline encoded values
-	// which are supposed to be roundtripped to AWS.
-	// Ref: https://tools.ietf.org/html/rfc3986#section-2.2
-	// Ref: https://golang.org/pkg/net/url/#URL
-	req.URL = &url.URL{
-		Scheme:   parsedURL.Scheme,
-		Host:     parsedURL.Host,
-		Opaque:   parsedURL.RawPath,
-		RawQuery: parsedURL.RawQuery,
-	}
-	// Although it seems reasonable to set the Content-Type to "application/json" - don't.
-	// The Content-Type must be an empty string in order for the
-	// AWS Signature checker to pass.
-	// Ref: http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/aws-properties-lambda-function-code.html
-	req.Header.Set("Content-Type", "")
-	req.Header.Set("Content-Length", strconv.Itoa(responseBuffer.Len()))
-
-	logger.WithFields(logrus.Fields{
-		"ResponseURL": req.URL,
-	}).Debug("CloudFormation ResponseURL")
-
-	client := &http.Client{}
-	resp, httpErr := client.Do(req)
-	if httpErr != nil {
-		return httpErr
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		body, _ := ioutil.ReadAll(resp.Body)
-		return fmt.Errorf("Error sending response: %d. Data: %s", resp.StatusCode, string(body))
-	}
-	return nil
-}
-
 // Handle processes the given CustomResourceRequest value
 func Handle(request *CustomResourceRequest, logger *logrus.Logger) error {
+
+	logger.WithFields(logrus.Fields{
+		"Name":    aws.SDKName,
+		"Version": aws.SDKVersion,
+	}).Info("CloudFormation CustomResource AWS SDK info")
+
 	session := awsSession(logger)
+
+	var operationOutputs map[string]interface{}
+	var operationError error
+	executeOp := false
 
 	logger.WithFields(logrus.Fields{
 		"Request": request,
@@ -221,35 +302,74 @@ func Handle(request *CustomResourceRequest, logger *logrus.Logger) error {
 
 	marshaledProperties, marshalError := json.Marshal(request.ResourceProperties)
 	if nil != marshalError {
-		return marshalError
+		operationError = marshalError
+	}
+	if nil == operationError {
+		// Don't forward to the CustomAction handler iff we're in CLEANUP mode
+		describeStacksInput := &cloudformation.DescribeStacksInput{
+			StackName: aws.String(request.StackID),
+		}
+		cfSvc := cloudformation.New(session)
+		describeStacksOutput, describeStacksOutputErr := cfSvc.DescribeStacks(describeStacksInput)
+		if nil != describeStacksOutputErr {
+			operationError = describeStacksOutputErr
+		} else {
+			stackDesc := describeStacksOutput.Stacks[0]
+			if nil == stackDesc {
+				operationError = fmt.Errorf("Failed to describe stack: %s", request.StackID)
+			} else {
+				executeOp = ("UPDATE_COMPLETE_CLEANUP_IN_PROGRESS" != *stackDesc.StackStatus)
+			}
+		}
+	}
+	goAWSResourceType, resourceTypeOK := request.ResourceProperties["GoAWSType"].(string)
+	if !resourceTypeOK {
+		goAWSResourceType = "Unknown"
 	}
 
-	commandTypeName := request.ResourceProperties["GoAWSType"].(string)
-	commandInstance, commandError := customCommandForTypeName(commandTypeName, &marshaledProperties)
-	if nil != commandError {
-		return commandError
+	if nil == operationError && executeOp {
+		commandInstance, commandError := customCommandForTypeName(goAWSResourceType, &marshaledProperties)
+		if nil != commandError {
+			return commandError
+		}
+		// TODO - lift this into a backoff/retry loop
+		customCommandHandler := commandInstance.(CustomResourceCommand)
+		switch request.RequestType {
+		case CreateOperation:
+			operationOutputs, operationError = customCommandHandler.create(session, logger)
+		case DeleteOperation:
+			operationOutputs, operationError = customCommandHandler.delete(session, logger)
+			if operationError != nil {
+				logger.WithFields(logrus.Fields{
+					"Request": request,
+					"Error":   operationError,
+				}).Warn("Failed to delete resource during Delete operation")
+				operationError = nil
+			}
+		case UpdateOperation:
+			operationOutputs, operationError = customCommandHandler.update(session, logger)
+		default:
+			operationError = fmt.Errorf("Unsupported operation: %s", request.RequestType)
+		}
 	}
-
-	// TODO - lift this into a backoff/retry loop
-	customCommandHandler := commandInstance.(CustomResourceCommand)
-	var operationOutputs map[string]interface{}
-	var operationError error
-	switch request.RequestType {
-	case CreateOperation:
-		operationOutputs, operationError = customCommandHandler.create(session, logger)
-	case DeleteOperation:
-		operationOutputs, operationError = customCommandHandler.delete(session, logger)
-	case UpdateOperation:
-		operationOutputs, operationError = customCommandHandler.update(session, logger)
-	default:
-		operationError = fmt.Errorf("Unsupported operation: %s", request.RequestType)
+	if nil != operationError {
+		logger.WithFields(logrus.Fields{
+			"Operation":    request.RequestType,
+			"ResourceType": goAWSResourceType,
+			"Error":        operationError,
+		}).Error("Failed to execute CustomResource request")
 	}
+	// Notify CloudFormation of the result
 	if "" != request.ResponseURL {
 		sendErr := sendCloudFormationResponse(request, operationOutputs, operationError, logger)
 		if nil != sendErr {
 			logger.WithFields(logrus.Fields{
-				"Error": sendErr,
-			}).Error("Failed to notify CloudFormation of result.")
+				"Error": sendErr.Error(),
+			}).Info("Failed to notify CloudFormation of result.")
+		} else {
+			// If the cloudformation notification was complete, then this
+			// execution functioned properly and we can clear the Error
+			operationError = nil
 		}
 	}
 	return operationError
