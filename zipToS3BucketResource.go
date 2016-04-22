@@ -99,25 +99,26 @@ func (command ZipToS3BucketResource) unzip(session *session.Session,
 		stream.Close()
 	}
 	// Need to add the manifest data iff defined
-	manifestBytes, manifestErr := json.Marshal(command.Manifest)
-	if nil != manifestErr {
-		return nil, manifestErr
+	if nil != command.Manifest {
+		manifestBytes, manifestErr := json.Marshal(command.Manifest)
+		if nil != manifestErr {
+			return nil, manifestErr
+		}
+		name := command.ManifestName
+		if "" == name {
+			name = DefaultManifestName
+		}
+		s3PutObject := &s3.PutObjectInput{
+			Body:        bytes.NewReader(manifestBytes),
+			Bucket:      aws.String(command.DestBucket.Literal),
+			Key:         aws.String(name),
+			ContentType: aws.String("application/json"),
+		}
+		_, err := svc.PutObject(s3PutObject)
+		if err != nil {
+			return nil, err
+		}
 	}
-	name := command.ManifestName
-	if "" == name {
-		name = DefaultManifestName
-	}
-	s3PutObject := &s3.PutObjectInput{
-		Body:        bytes.NewReader(manifestBytes),
-		Bucket:      aws.String(command.DestBucket.Literal),
-		Key:         aws.String(name),
-		ContentType: aws.String("application/json"),
-	}
-	_, err := svc.PutObject(s3PutObject)
-	if err != nil {
-		return nil, err
-	}
-
 	// Log some information
 	logger.WithFields(logrus.Fields{
 		"TotalFileCount": totalFiles,
@@ -171,20 +172,22 @@ func (command ZipToS3BucketResource) delete(session *session.Session,
 		return nil, err
 	}
 
-	// Cleanup the Manifest
-	name := command.ManifestName
-	if "" == name {
-		name = DefaultManifestName
+	// Cleanup the Manifest iff defined
+	var deleteErr error
+	if nil != command.Manifest {
+		name := command.ManifestName
+		if "" == name {
+			name = DefaultManifestName
+		}
+		manifestDeleteParams := &s3.DeleteObjectInput{
+			Bucket: aws.String(command.DestBucket.Literal),
+			Key:    aws.String(name),
+		}
+		_, deleteErr = svc.DeleteObject(manifestDeleteParams)
+		logger.WithFields(logrus.Fields{
+			"TotalDeletedCount": totalItemsDeleted,
+			"S3Bucket":          command.DestBucket,
+		}).Info("Purged S3 Bucket")
 	}
-	manifestDeleteParams := &s3.DeleteObjectInput{
-		Bucket: aws.String(command.DestBucket.Literal),
-		Key:    aws.String(name),
-	}
-	_, deleteErr := svc.DeleteObject(manifestDeleteParams)
-	logger.WithFields(logrus.Fields{
-		"TotalDeletedCount": totalItemsDeleted,
-		"S3Bucket":          command.DestBucket,
-	}).Info("Purged S3 Bucket")
-
 	return nil, deleteErr
 }
