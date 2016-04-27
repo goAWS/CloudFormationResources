@@ -82,6 +82,8 @@ var (
 	HelloWorld = cloudFormationResourceType("HelloWorldResource")
 	// S3LambdaEventSource is the typename for S3LambdaEventSourceResource
 	S3LambdaEventSource = cloudFormationResourceType("S3LambdaEventSourceResource")
+	// SNSLambdaEventSource is the typename for SNSLambdaEventSourceResource
+	SNSLambdaEventSource = cloudFormationResourceType("SNSLambdaEventSourceResource")
 	// ZipToS3Bucket is the typename for ZipToS3Bucket
 	ZipToS3Bucket = cloudFormationResourceType("ZipToS3BucketResource")
 )
@@ -206,6 +208,16 @@ func customCommandForTypeName(resourceTypeName string, properties *[]byte) (inte
 		customCommand = &command
 	case S3LambdaEventSource:
 		command := S3LambdaEventSourceResource{
+			GoAWSCustomResource: GoAWSCustomResource{
+				GoAWSType: resourceTypeName,
+			},
+		}
+		if nil != properties {
+			unmarshalError = json.Unmarshal([]byte(string(*properties)), &command)
+		}
+		customCommand = &command
+	case SNSLambdaEventSource:
+		command := SNSLambdaEventSourceResource{
 			GoAWSCustomResource: GoAWSCustomResource{
 				GoAWSType: resourceTypeName,
 			},
