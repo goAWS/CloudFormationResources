@@ -62,10 +62,10 @@ func (action *SESLambdaEventSourceResourceAction) toReceiptAction(logger *logrus
 type SESLambdaEventSourceResourceRule struct {
 	Name        *gocf.StringExpr
 	Actions     []*SESLambdaEventSourceResourceAction
-	ScanEnabled *gocf.BoolExpr
-	Enabled     *gocf.BoolExpr
+	ScanEnabled *gocf.BoolExpr `json:",omitempty"`
+	Enabled     *gocf.BoolExpr `json:",omitempty"`
 	Recipients  []*gocf.StringExpr
-	TLSPolicy   *gocf.StringExpr
+	TLSPolicy   *gocf.StringExpr `json:",omitempty"`
 }
 
 func ensureSESRuleSetName(ruleSetName string, svc *ses.SES, logger *logrus.Logger) error {
