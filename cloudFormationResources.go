@@ -28,6 +28,21 @@ const (
 	UpdateOperation = "Update"
 )
 
+var (
+	// HelloWorld is the typename for HelloWorldResource
+	HelloWorld = cloudFormationResourceType("HelloWorldResource")
+	// S3LambdaEventSource is the typename for S3LambdaEventSourceResource
+	S3LambdaEventSource = cloudFormationResourceType("S3LambdaEventSourceResource")
+	// SNSLambdaEventSource is the typename for SNSLambdaEventSourceResource
+	SNSLambdaEventSource = cloudFormationResourceType("SNSLambdaEventSourceResource")
+	// SESLambdaEventSource is the typename for SESLambdaEventSourceResource
+	SESLambdaEventSource = cloudFormationResourceType("SESLambdaEventSourceResource")
+	// CloudWatchLogsLambdaEventSource is the typename for SESLambdaEventSourceResource
+	CloudWatchLogsLambdaEventSource = cloudFormationResourceType("CloudWatchLogsLambdaEventSourceResource")
+	// ZipToS3Bucket is the typename for ZipToS3Bucket
+	ZipToS3Bucket = cloudFormationResourceType("ZipToS3BucketResource")
+)
+
 // CloudFormationLambdaEvent represents the event data sent during a
 // Lambda invocation in the context of a CloudFormation operation.
 // Ref: http://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/crpg-ref-requests.html
@@ -77,18 +92,104 @@ type CustomResourceCommand interface {
 		logger *logrus.Logger) (map[string]interface{}, error)
 }
 
-var (
-	// HelloWorld is the typename for HelloWorldResource
-	HelloWorld = cloudFormationResourceType("HelloWorldResource")
-	// S3LambdaEventSource is the typename for S3LambdaEventSourceResource
-	S3LambdaEventSource = cloudFormationResourceType("S3LambdaEventSourceResource")
-	// SNSLambdaEventSource is the typename for SNSLambdaEventSourceResource
-	SNSLambdaEventSource = cloudFormationResourceType("SNSLambdaEventSourceResource")
-	// SESLambdaEventSource is the typename for SESLambdaEventSourceResource
-	SESLambdaEventSource = cloudFormationResourceType("SESLambdaEventSourceResource")
-	// ZipToS3Bucket is the typename for ZipToS3Bucket
-	ZipToS3Bucket = cloudFormationResourceType("ZipToS3BucketResource")
-)
+// Handle processes the given CustomResourceRequest value
+func Handle(request *CustomResourceRequest, logger *logrus.Logger) error {
+
+	logger.WithFields(logrus.Fields{
+		"Name":    aws.SDKName,
+		"Version": aws.SDKVersion,
+	}).Info("CloudFormation CustomResource AWS SDK info")
+
+	session := awsSession(logger)
+
+	var operationOutputs map[string]interface{}
+	var operationError error
+	executeOp := false
+
+	logger.WithFields(logrus.Fields{
+		"Request": request,
+	}).Debug("Incoming request")
+
+	marshaledProperties, marshalError := json.Marshal(request.ResourceProperties)
+	if nil != marshalError {
+		operationError = marshalError
+	}
+	if nil == operationError {
+		// Don't forward to the CustomAction handler iff we're in CLEANUP mode
+		describeStacksInput := &cloudformation.DescribeStacksInput{
+			StackName: aws.String(request.StackID),
+		}
+		cfSvc := cloudformation.New(session)
+		describeStacksOutput, describeStacksOutputErr := cfSvc.DescribeStacks(describeStacksInput)
+		if nil != describeStacksOutputErr {
+			operationError = describeStacksOutputErr
+		} else {
+			stackDesc := describeStacksOutput.Stacks[0]
+			if nil == stackDesc {
+				operationError = fmt.Errorf("Failed to describe stack: %s", request.StackID)
+			} else {
+				executeOp = ("UPDATE_COMPLETE_CLEANUP_IN_PROGRESS" != *stackDesc.StackStatus)
+			}
+		}
+	}
+	goAWSResourceType, resourceTypeOK := request.ResourceProperties["GoAWSType"].(string)
+	if !resourceTypeOK {
+		goAWSResourceType = "Unknown"
+	}
+
+	logger.WithFields(logrus.Fields{
+		"CustomResource": goAWSResourceType,
+		"Operation":      request.RequestType,
+		"StackId":        request.StackID,
+	}).Info("CustomResource request")
+
+	if nil == operationError && executeOp {
+		commandInstance, commandError := customCommandForTypeName(goAWSResourceType, &marshaledProperties)
+		if nil != commandError {
+			return commandError
+		}
+		// TODO - lift this into a backoff/retry loop
+		customCommandHandler := commandInstance.(CustomResourceCommand)
+		switch request.RequestType {
+		case CreateOperation:
+			operationOutputs, operationError = customCommandHandler.create(session, logger)
+		case DeleteOperation:
+			operationOutputs, operationError = customCommandHandler.delete(session, logger)
+			if operationError != nil {
+				logger.WithFields(logrus.Fields{
+					"Request": request,
+					"Error":   operationError,
+				}).Warn("Failed to delete resource during Delete operation")
+				operationError = nil
+			}
+		case UpdateOperation:
+			operationOutputs, operationError = customCommandHandler.update(session, logger)
+		default:
+			operationError = fmt.Errorf("Unsupported operation: %s", request.RequestType)
+		}
+	}
+	if nil != operationError {
+		logger.WithFields(logrus.Fields{
+			"Operation":    request.RequestType,
+			"ResourceType": goAWSResourceType,
+			"Error":        operationError,
+		}).Error("Failed to execute CustomResource request")
+	}
+	// Notify CloudFormation of the result
+	if "" != request.ResponseURL {
+		sendErr := sendCloudFormationResponse(request, operationOutputs, operationError, logger)
+		if nil != sendErr {
+			logger.WithFields(logrus.Fields{
+				"Error": sendErr.Error(),
+			}).Info("Failed to notify CloudFormation of result.")
+		} else {
+			// If the cloudformation notification was complete, then this
+			// execution functioned properly and we can clear the Error
+			operationError = nil
+		}
+	}
+	return operationError
+}
 
 func sendCloudFormationResponse(customResourceRequest *CustomResourceRequest,
 	results map[string]interface{},
@@ -248,8 +349,17 @@ func customCommandForTypeName(resourceTypeName string, properties *[]byte) (inte
 			unmarshalError = json.Unmarshal([]byte(string(*properties)), &command)
 		}
 		customCommand = &command
+	case CloudWatchLogsLambdaEventSource:
+		command := CloudWatchLogsLambdaEventSourceResource{
+			GoAWSCustomResource: GoAWSCustomResource{
+				GoAWSType: resourceTypeName,
+			},
+		}
+		if nil != properties {
+			unmarshalError = json.Unmarshal([]byte(string(*properties)), &command)
+		}
+		customCommand = &command
 	}
-
 	// END - RESOURCE TYPES
 	// ---------------------------------------------------------------------------
 
@@ -296,7 +406,7 @@ func awsSession(logger *logrus.Logger) *session.Session {
 	// Log AWS calls if needed
 	switch logger.Level {
 	case logrus.DebugLevel:
-		awsConfig.LogLevel = aws.LogLevel(aws.LogDebugWithRequestErrors)
+		awsConfig.LogLevel = aws.LogLevel(aws.LogDebugWithHTTPBody)
 	}
 	awsConfig.Logger = &logrusProxy{logger}
 	sess := session.New(awsConfig)
@@ -316,103 +426,4 @@ func awsSession(logger *logrus.Logger) *session.Session {
 // custom CloudFormation resource typename
 func cloudFormationResourceType(resType string) string {
 	return fmt.Sprintf("Custom::goAWS::%s", resType)
-}
-
-// Handle processes the given CustomResourceRequest value
-func Handle(request *CustomResourceRequest, logger *logrus.Logger) error {
-
-	logger.WithFields(logrus.Fields{
-		"Name":    aws.SDKName,
-		"Version": aws.SDKVersion,
-	}).Info("CloudFormation CustomResource AWS SDK info")
-
-	session := awsSession(logger)
-
-	var operationOutputs map[string]interface{}
-	var operationError error
-	executeOp := false
-
-	logger.WithFields(logrus.Fields{
-		"Request": request,
-	}).Debug("Incoming request")
-
-	marshaledProperties, marshalError := json.Marshal(request.ResourceProperties)
-	if nil != marshalError {
-		operationError = marshalError
-	}
-	if nil == operationError {
-		// Don't forward to the CustomAction handler iff we're in CLEANUP mode
-		describeStacksInput := &cloudformation.DescribeStacksInput{
-			StackName: aws.String(request.StackID),
-		}
-		cfSvc := cloudformation.New(session)
-		describeStacksOutput, describeStacksOutputErr := cfSvc.DescribeStacks(describeStacksInput)
-		if nil != describeStacksOutputErr {
-			operationError = describeStacksOutputErr
-		} else {
-			stackDesc := describeStacksOutput.Stacks[0]
-			if nil == stackDesc {
-				operationError = fmt.Errorf("Failed to describe stack: %s", request.StackID)
-			} else {
-				executeOp = ("UPDATE_COMPLETE_CLEANUP_IN_PROGRESS" != *stackDesc.StackStatus)
-			}
-		}
-	}
-	goAWSResourceType, resourceTypeOK := request.ResourceProperties["GoAWSType"].(string)
-	if !resourceTypeOK {
-		goAWSResourceType = "Unknown"
-	}
-
-	logger.WithFields(logrus.Fields{
-		"CustomResource": goAWSResourceType,
-		"Operation":      request.RequestType,
-		"StackId":        request.StackID,
-	}).Info("CustomResource request")
-
-	if nil == operationError && executeOp {
-		commandInstance, commandError := customCommandForTypeName(goAWSResourceType, &marshaledProperties)
-		if nil != commandError {
-			return commandError
-		}
-		// TODO - lift this into a backoff/retry loop
-		customCommandHandler := commandInstance.(CustomResourceCommand)
-		switch request.RequestType {
-		case CreateOperation:
-			operationOutputs, operationError = customCommandHandler.create(session, logger)
-		case DeleteOperation:
-			operationOutputs, operationError = customCommandHandler.delete(session, logger)
-			if operationError != nil {
-				logger.WithFields(logrus.Fields{
-					"Request": request,
-					"Error":   operationError,
-				}).Warn("Failed to delete resource during Delete operation")
-				operationError = nil
-			}
-		case UpdateOperation:
-			operationOutputs, operationError = customCommandHandler.update(session, logger)
-		default:
-			operationError = fmt.Errorf("Unsupported operation: %s", request.RequestType)
-		}
-	}
-	if nil != operationError {
-		logger.WithFields(logrus.Fields{
-			"Operation":    request.RequestType,
-			"ResourceType": goAWSResourceType,
-			"Error":        operationError,
-		}).Error("Failed to execute CustomResource request")
-	}
-	// Notify CloudFormation of the result
-	if "" != request.ResponseURL {
-		sendErr := sendCloudFormationResponse(request, operationOutputs, operationError, logger)
-		if nil != sendErr {
-			logger.WithFields(logrus.Fields{
-				"Error": sendErr.Error(),
-			}).Info("Failed to notify CloudFormation of result.")
-		} else {
-			// If the cloudformation notification was complete, then this
-			// execution functioned properly and we can clear the Error
-			operationError = nil
-		}
-	}
-	return operationError
 }
