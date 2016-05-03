@@ -24,12 +24,11 @@ func TestUnzip(t *testing.T) {
 	if nil != createError {
 		t.Errorf("Failed to create Unzip resource: %s", createError)
 	}
-	t.Logf("TestUnzip outputs: %s", createOutputs)
+	t.Logf("TestUnzip outputs: %#v", createOutputs)
 
 	deleteOutputs, deleteError := zipResource.delete(awsSession, logger)
 	if nil != deleteError {
 		t.Errorf("Failed to create Unzip resource: %s", createError)
 	}
-	t.Logf("TestUnzip outputs: %s", deleteOutputs)
-
+	t.Logf("TestUnzip outputs: %#v", deleteOutputs)
 }
