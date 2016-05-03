@@ -58,9 +58,16 @@ type CloudFormationLambdaEvent struct {
 	OldResourceProperties map[string]interface{}
 }
 
-// CustomResourceRequest is the go representation of the CloudFormation resource
-// request
-type CustomResourceRequest struct {
+// CustomResourceFunction defines a free function that is capable of responding to
+// an incoming Lambda-backed CustomResource request and returning either a
+// map of outputs or an error.  It is invoked by Run().
+type CustomResourceFunction func(requestType string,
+	stackID string,
+	properties map[string]interface{},
+	logger *logrus.Logger) (map[string]interface{}, error)
+
+// AbstractCustomResourceRequest is the base structure used for CustomResourceRequests
+type AbstractCustomResourceRequest struct {
 	RequestType        string
 	ResponseURL        string
 	StackID            string `json:"StackId"`
@@ -72,7 +79,22 @@ type CustomResourceRequest struct {
 	ResourceProperties map[string]interface{}
 }
 
-// GoAWSCustomResource does SpartaApplication-S3CustomResourced9468234fca3ffb5
+// UserFuncResourceRequest is the go representation of the CloudFormation resource
+// request which is handled by a user supplied function. The function result is
+// used as the results for the
+type UserFuncResourceRequest struct {
+	AbstractCustomResourceRequest
+	LambdaHandler CustomResourceFunction
+}
+
+// CustomResourceRequest is the go representation of a CloudFormation resource
+// request for a resource the catalog that had been previously serialized.
+type CustomResourceRequest struct {
+	AbstractCustomResourceRequest
+}
+
+// GoAWSCustomResource is the common embedded struct for all resources defined
+// by cloudformationresources
 type GoAWSCustomResource struct {
 	gocf.CloudFormationCustomResource
 	GoAWSType string
@@ -92,13 +114,41 @@ type CustomResourceCommand interface {
 		logger *logrus.Logger) (map[string]interface{}, error)
 }
 
-// Handle processes the given CustomResourceRequest value
-func Handle(request *CustomResourceRequest, logger *logrus.Logger) error {
-
+// Run manages invoking a user supplied function to perform
+// the CloudFormation resource operation. Clients do not need
+// to implement anything cloudformationresource related.
+func Run(request *UserFuncResourceRequest, logger *logrus.Logger) error {
 	logger.WithFields(logrus.Fields{
 		"Name":    aws.SDKName,
 		"Version": aws.SDKVersion,
-	}).Info("CloudFormation CustomResource AWS SDK info")
+	}).Debug("CloudFormation CustomResource AWS SDK info")
+
+	operationOutputs, operationError := request.LambdaHandler(request.RequestType,
+		request.StackID,
+		request.ResourceProperties,
+		logger)
+
+	// Notify CloudFormation of the result
+	if "" != request.ResponseURL {
+		sendErr := sendCloudFormationResponse(&request.AbstractCustomResourceRequest,
+			operationOutputs,
+			operationError,
+			logger)
+		if nil != sendErr {
+			logger.WithFields(logrus.Fields{
+				"Error": sendErr.Error(),
+			}).Info("Failed to notify CloudFormation of result.")
+		} else {
+			// If the cloudformation notification was complete, then this
+			// execution functioned properly and we can clear the Error
+			operationError = nil
+		}
+	}
+	return operationError
+}
+
+// Handle processes the given CustomResourceRequest value
+func Handle(request *CustomResourceRequest, logger *logrus.Logger) error {
 
 	session := awsSession(logger)
 
@@ -177,7 +227,7 @@ func Handle(request *CustomResourceRequest, logger *logrus.Logger) error {
 	}
 	// Notify CloudFormation of the result
 	if "" != request.ResponseURL {
-		sendErr := sendCloudFormationResponse(request, operationOutputs, operationError, logger)
+		sendErr := sendCloudFormationResponse(&request.AbstractCustomResourceRequest, operationOutputs, operationError, logger)
 		if nil != sendErr {
 			logger.WithFields(logrus.Fields{
 				"Error": sendErr.Error(),
@@ -191,7 +241,7 @@ func Handle(request *CustomResourceRequest, logger *logrus.Logger) error {
 	return operationError
 }
 
-func sendCloudFormationResponse(customResourceRequest *CustomResourceRequest,
+func sendCloudFormationResponse(customResourceRequest *AbstractCustomResourceRequest,
 	results map[string]interface{},
 	responseErr error,
 	logger *logrus.Logger) error {
@@ -229,7 +279,7 @@ func sendCloudFormationResponse(customResourceRequest *CustomResourceRequest,
 		responseData["Data"] = map[string]interface{}{
 			"Error": responseErr,
 		}
-	} else if len(results) != 0 {
+	} else if nil != results {
 		responseData["Data"] = results
 	} else {
 		responseData["Data"] = map[string]interface{}{}
