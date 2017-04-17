@@ -10,6 +10,7 @@ import (
 
 	"github.com/Sirupsen/logrus"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/request"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudformation"
@@ -148,10 +149,11 @@ func Run(request *UserFuncResourceRequest, logger *logrus.Logger) error {
 }
 
 // Handle processes the given CustomResourceRequest value
-func Handle(request *CustomResourceRequest, logger *logrus.Logger) error {
+func Handle(request *CustomResourceRequest,
+	customCreds credentials.Value,
+	logger *logrus.Logger) error {
 
-	session := awsSession(logger)
-
+	session := awsSession(customCreds, logger)
 	var operationOutputs map[string]interface{}
 	var operationError error
 	executeOp := false
@@ -449,10 +451,16 @@ func (proxy *logrusProxy) Log(args ...interface{}) {
 // Returns an AWS Session (https://github.com/aws/aws-sdk-go/wiki/Getting-Started-Configuration)
 // object that attaches a debug level handler to all AWS requests from services
 // sharing the session value.
-func awsSession(logger *logrus.Logger) *session.Session {
+func awsSession(customCreds credentials.Value, logger *logrus.Logger) *session.Session {
 	awsConfig := &aws.Config{
 		CredentialsChainVerboseErrors: aws.Bool(true),
 	}
+
+	if len(customCreds.AccessKeyID) != 0 &&
+		len(customCreds.SecretAccessKey) != 0 {
+		awsConfig = awsConfig.WithCredentials(credentials.NewStaticCredentialsFromCreds(customCreds))
+	}
+
 	// Log AWS calls if needed
 	switch logger.Level {
 	case logrus.DebugLevel:
