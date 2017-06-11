@@ -5,7 +5,7 @@ import (
 	"testing"
 
 	"github.com/Sirupsen/logrus"
-	gocf "github.com/crewjam/go-cloudformation"
+	gocf "github.com/mweagle/go-cloudformation"
 )
 
 func TestUnzip(t *testing.T) {
